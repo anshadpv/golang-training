@@ -10,6 +10,7 @@ import (
 	"sync"
 	"text/template"
 
+	"github.com/bluele/gcache"
 	"github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
@@ -21,11 +22,8 @@ type TemplateData struct {
 	FieldData map[string]interface{} `json:"fieldData"`
 }
 
-// for storing templates
-type TemplateStorage map[string]TemplateData
-
 // in-memory storage for templates.
-var InMemoryDB TemplateStorage
+var InMemoryDB gcache.Cache
 
 // MySQL database connection.
 var MySQLDB *sql.DB
@@ -37,7 +35,7 @@ var mu sync.Mutex
 
 func init() {
 	// Initializing in-memory storage.
-	InMemoryDB = make(TemplateStorage)
+	InMemoryDB = gcache.New(20).Build()
 
 	// Initializing MySQL database connection.
 	var err error
@@ -81,15 +79,44 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//checking if template name is empty
+	if strings.TrimSpace(templateData.Name) == "" {
+		http.Error(w, "Template name cannot be empty.", http.StatusBadRequest)
+		return
+	}
+
+	//checking if template data is empty
+	if strings.TrimSpace(templateData.Content) == "" {
+		http.Error(w, "Template Content cannot be empty.", http.StatusBadRequest)
+		return
+	}
+
+	var existing string
+	err = MySQLDB.QueryRow("SELECT content FROM templates WHERE name = ?", templateData.Name).Scan(&existing)
+	switch {
+	case err == sql.ErrNoRows:
+
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on selecting from db.")
+		return
+
+	default:
+		log.Println("Template already exists.")
+		http.Error(w, "Template already exists.", http.StatusConflict)
+		return
+	}
+
 	// Store data in in-memory storage.
 	mu.Lock()
-	InMemoryDB[templateData.Name] = templateData
+	InMemoryDB.Set(templateData.Name, templateData.Content)
 	mu.Unlock()
 
 	// Store data in MySQL database.
 	_, err = MySQLDB.Exec("INSERT INTO templates (name, content) VALUES (?, ?)", templateData.Name, templateData.Content)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on inserting to mySQL.")
 		return
 	}
 
@@ -97,6 +124,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	err = RedisClient.Set(r.Context(), templateData.Name, templateData.Content, 0).Err()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on inserting to redis.")
 		return
 	}
 
@@ -111,26 +139,29 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	templateName := vars["template_name"]
 
 	//checking the existance
-	var existingTemplate string
-	err := MySQLDB.QueryRow("SELECT content FROM templates WHERE name = ?", templateName).Scan(&existingTemplate)
+	var existing string
+	err := MySQLDB.QueryRow("SELECT content FROM templates WHERE name = ?", templateName).Scan(&existing)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.Error(w, fmt.Sprintf("Template %s not found", templateName), http.StatusNotFound)
+			log.Println("No such template to delete.")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on selecting from db.")
 		return
 	}
 
 	// Removing data from in-memory storage.
 	mu.Lock()
-	delete(InMemoryDB, templateName)
+	InMemoryDB.Remove(templateName)
 	mu.Unlock()
 
 	// Removing data from MySQL database.
 	_, err = MySQLDB.Exec("DELETE FROM templates WHERE name = ?", templateName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on deleting from mySQL.")
 		return
 	}
 
@@ -138,6 +169,7 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	err = RedisClient.Del(r.Context(), templateName).Err()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on deleting from redis.")
 		return
 	}
 
@@ -156,6 +188,7 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	err := json.NewDecoder(r.Body).Decode(&updatedTemplate)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		log.Println("Error on decoding the request body.")
 		return
 	}
 
@@ -164,21 +197,24 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.Error(w, fmt.Sprintf("Template %s not found", templateName), http.StatusNotFound)
+			log.Println("No such template to update.")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on selecting from db.")
 		return
 	}
 
 	// Updating in-memory storage.
 	mu.Lock()
-	InMemoryDB[templateName] = updatedTemplate
+	InMemoryDB.Set(templateName, updatedTemplate.Content)
 	mu.Unlock()
 
 	// Updating in MySQL database.
 	_, err = MySQLDB.Exec("UPDATE templates SET content = ? WHERE name = ?", updatedTemplate.Content, templateName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on updating in mySQL.")
 		return
 	}
 
@@ -186,6 +222,7 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	err = RedisClient.Set(r.Context(), templateName, updatedTemplate.Content, 0).Err()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on updating in redis.")
 		return
 	}
 	// Respond with success message.
@@ -198,6 +235,7 @@ func getAllTemplatesHandler(w http.ResponseWriter, r *http.Request) {
 	rows, err := MySQLDB.Query("SELECT name, content FROM templates")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on selecting from db.")
 		return
 	}
 	defer rows.Close()
@@ -210,6 +248,7 @@ func getAllTemplatesHandler(w http.ResponseWriter, r *http.Request) {
 		err := rows.Scan(&template.Name, &template.Content)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Println("Error on scanning from db.")
 			return
 		}
 		templates = append(templates, template)
@@ -230,9 +269,11 @@ func executeTemplateHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.Error(w, fmt.Sprintf("Template %s not found", templateName), http.StatusNotFound)
+			log.Println("No such template to execute.")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on selecting from db.")
 		return
 	}
 
@@ -243,6 +284,7 @@ func executeTemplateHandler(w http.ResponseWriter, r *http.Request) {
 	err = json.NewDecoder(r.Body).Decode(&requestPayload)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		log.Println("Error on decoding from request body.")
 		return
 	}
 
@@ -250,6 +292,7 @@ func executeTemplateHandler(w http.ResponseWriter, r *http.Request) {
 	executedContent, err := executeTemplate(templateContent, requestPayload.FieldData)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on executing the template.")
 		return
 	}
 
@@ -260,14 +303,19 @@ func executeTemplateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func executeTemplate(templateContent string, data map[string]interface{}) (string, error) {
+
+	//creating new template
 	tmpl, err := template.New("template").Parse(templateContent)
 	if err != nil {
+		log.Println("Error on creating template.")
 		return "", err
 	}
 
+	//updating placeholder
 	var result strings.Builder
 	err = tmpl.Execute(&result, data)
 	if err != nil {
+		log.Println("Error on replacing placeholders.")
 		return "", err
 	}
 
@@ -279,26 +327,24 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	rows, err := MySQLDB.Query("SELECT name, content FROM templates")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Error on selecting from db.")
 		return
 	}
 	defer rows.Close()
-
-	refreshedData := make(TemplateStorage)
 
 	// Iterating over the result set and populate the refreshedData map.
 	for rows.Next() {
 		var template TemplateData
 		if err := rows.Scan(&template.Name, &template.Content); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Println("Error on refreshing the db.")
 			return
 		}
-		refreshedData[template.Name] = template
+		//updating the in memory db
+		mu.Lock()
+		InMemoryDB.Set(template.Name, template.Content)
+		mu.Unlock()
 	}
-
-	// Updating the InMemoryDB with the refreshed data.
-	mu.Lock()
-	InMemoryDB = refreshedData
-	mu.Unlock()
 
 	// Responding with a success message.
 	w.WriteHeader(http.StatusOK)
