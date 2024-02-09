@@ -6,9 +6,6 @@ type Database interface {
 	//Delete()
 }
 
-type sample interface {
-}
-
 var maap = make(map[int]string)
 
 func main() {
